@@ -1,410 +1,525 @@
-using UnityEngine;
-using UnityEditor;
+using System;
 using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
 
+/// <summary>
+/// Copies the lowest plausible surface from a photogrammetry capture into a Unity Terrain.
+/// It is an editor tool, not a component: open it from Tools > Terrain Snap.
+/// </summary>
 public class TerrainSnapWindow : EditorWindow
 {
-    public Terrain terrain;
-    public GameObject referenceMesh;
-    public float rayHeight = 2000f;
-    [Range(0f, 1f)] public float blend = 1f;
-    public bool smoothAfter = false;
-    public int sampleStep = 1;
+    [SerializeField] private Terrain terrain;
+    [SerializeField] private GameObject referenceMesh;
+    [SerializeField] private float rayHeight = 2000f;
+    [SerializeField, Range(0f, 1f)] private float blend = 1f;
+    [SerializeField, Min(1)] private int sampleStep = 1;
+    [SerializeField] private bool removeUpwardSpikes = true;
+    [SerializeField, Min(1)] private int spikeNeighbourRadius = 2;
+    [SerializeField, Min(0.01f)] private float spikeHeightThreshold = 5f;
+    [SerializeField] private bool smoothAfter;
 
-    // Ground detection parameters (single intelligent algorithm)
-    [Header("Ground Detection")]
-    [Tooltip("Maximum surface slope (degrees) to consider as ground. Surfaces steeper than this are ignored.")]
-    public float MaxSlope = 70f;
+    [SerializeField] private bool useSelectionArea;
+    [SerializeField] private bool hasSelection;
+    [SerializeField] private Vector3 selectionPointA;
+    [SerializeField] private Vector3 selectionPointB;
 
-    [Tooltip("Minimum object thickness (meters). Objects thinner than this (wires, cables) are ignored.")]
-    public float MinObjectThickness = 1f;
+    private bool selectingFirstPoint;
+    private bool selectingSecondPoint;
+    private readonly RaycastHit[] raycastBuffer = new RaycastHit[128];
+    private readonly HashSet<Collider> sourceColliders = new HashSet<Collider>();
 
-    [Tooltip("Ignore isolated spikes higher than this value (meters) compared to neighbouring terrain samples.")]
-    public float SpikeHeightThreshold = 5f;
-
-    [Tooltip("Neighbour radius (in heightmap samples) used to compute local average for spike detection.")]
-    public int NeighbourRadius = 2;
-
-    [Tooltip("Draw debug rays in the Scene view: green = accepted hit, red = rejected hit.")]
-    public bool DebugDraw = false;
-
-    // Reusable buffers to avoid allocations in the inner loop
-    private RaycastHit[] hitsBuffer = new RaycastHit[32];
-    private RaycastHit[] thicknessBuffer = new RaycastHit[8];
-
-    [Header("Selection Area")]
-    [Tooltip("When enabled, only sample heights inside the selected area on the reference mesh.")]
-    public bool useSelectionArea = false;
-
-    // internal selection state (XZ world-space rectangle)
-    private bool isSelectingArea = false;
-    private bool hasValidSelection = false;
-    private Vector3 areaPointA;
-    private Vector3 areaPointB;
-    private float areaMinX, areaMaxX, areaMinZ, areaMaxZ;
-
-    [MenuItem("Tools/Terrain Snap Window")]
+    [MenuItem("Tools/Terrain Snap")]
     public static void ShowWindow()
     {
         GetWindow<TerrainSnapWindow>("Terrain Snap");
     }
 
-    void OnGUI()
+    private void OnEnable()
+    {
+        SceneView.duringSceneGui += OnSceneGUI;
+    }
+
+    private void OnDisable()
+    {
+        SceneView.duringSceneGui -= OnSceneGUI;
+    }
+
+    private void OnGUI()
     {
         EditorGUILayout.LabelField("Source and Target", EditorStyles.boldLabel);
         terrain = (Terrain)EditorGUILayout.ObjectField("Terrain", terrain, typeof(Terrain), true);
         referenceMesh = (GameObject)EditorGUILayout.ObjectField("Reference Mesh Root", referenceMesh, typeof(GameObject), true);
 
         EditorGUILayout.Space();
-        EditorGUILayout.LabelField("Settings", EditorStyles.boldLabel);
-        rayHeight = EditorGUILayout.FloatField("Ray Height", rayHeight);
-        sampleStep = EditorGUILayout.IntField("Sample Step", Mathf.Max(1, sampleStep));
+        EditorGUILayout.LabelField("Sampling", EditorStyles.boldLabel);
+        rayHeight = Mathf.Max(1f, EditorGUILayout.FloatField("Ray Height", rayHeight));
+        sampleStep = EditorGUILayout.IntSlider("Sample Step", sampleStep, 1, 8);
         blend = EditorGUILayout.Slider("Blend", blend, 0f, 1f);
-        smoothAfter = EditorGUILayout.Toggle("Smooth After", smoothAfter);
 
         EditorGUILayout.Space();
-        EditorGUILayout.LabelField("Ground Detection", EditorStyles.boldLabel);
-        MaxSlope = EditorGUILayout.Slider("Max Slope (deg)", MaxSlope, 0f, 89f);
-        MinObjectThickness = EditorGUILayout.FloatField("Min Object Thickness (m)", MinObjectThickness);
-        SpikeHeightThreshold = EditorGUILayout.FloatField("Spike Height Threshold (m)", SpikeHeightThreshold);
-        NeighbourRadius = EditorGUILayout.IntField("Neighbour Radius (samples)", Mathf.Max(0, NeighbourRadius));
-        DebugDraw = EditorGUILayout.Toggle("Debug Draw Rays", DebugDraw);
-
-        if (GUILayout.Button("Copy Heights"))
+        EditorGUILayout.LabelField("Cleanup", EditorStyles.boldLabel);
+        removeUpwardSpikes = EditorGUILayout.Toggle("Remove Upward Spikes", removeUpwardSpikes);
+        using (new EditorGUI.DisabledScope(!removeUpwardSpikes))
         {
-            CopyHeights();
+            spikeNeighbourRadius = EditorGUILayout.IntSlider("Neighbour Radius", spikeNeighbourRadius, 1, 8);
+            spikeHeightThreshold = Mathf.Max(0.01f, EditorGUILayout.FloatField("Spike Height (metres)", spikeHeightThreshold));
+        }
+
+        smoothAfter = EditorGUILayout.Toggle("Smooth After", smoothAfter);
+        EditorGUILayout.HelpBox(
+            "Cleanup removes only isolated heights above their local median. " +
+            "Low areas such as ponds, ditches and valleys are kept.",
+            MessageType.Info);
+
+        EditorGUILayout.Space();
+        DrawSelectionControls();
+
+        EditorGUILayout.Space();
+        using (new EditorGUI.DisabledScope(terrain == null || referenceMesh == null || (useSelectionArea && !hasSelection)))
+        {
+            if (GUILayout.Button("Copy Heights", GUILayout.Height(30f)))
+            {
+                CopyHeights();
+            }
         }
     }
 
-    void OnEnable()
+    private void DrawSelectionControls()
     {
-        // subscribe to SceneView events so user can pick selection area
-        SceneView.duringSceneGui += OnSceneGUI;
-    }
+        EditorGUILayout.LabelField("Selection Area", EditorStyles.boldLabel);
+        useSelectionArea = EditorGUILayout.Toggle("Limit To Selected Area", useSelectionArea);
 
-    void OnDisable()
-    {
-        SceneView.duringSceneGui -= OnSceneGUI;
-    }
-
-    void OnSceneGUI(SceneView sv)
-    {
-        if (!useSelectionArea) return;
-
-        Handles.BeginGUI();
-        GUILayout.BeginArea(new Rect(10, 10, 220, 120), EditorStyles.helpBox);
-        GUILayout.Label("Selection Area", EditorStyles.boldLabel);
-        if (!isSelectingArea)
+        if (!useSelectionArea)
         {
-            if (GUILayout.Button("Start Area Selection (scene click A then B)"))
+            return;
+        }
+
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button(hasSelection ? "Pick New Area" : "Pick Area In Scene"))
+        {
+            selectingFirstPoint = true;
+            selectingSecondPoint = false;
+            hasSelection = false;
+            SceneView.RepaintAll();
+        }
+
+        using (new EditorGUI.DisabledScope(!hasSelection && !selectingFirstPoint && !selectingSecondPoint))
+        {
+            if (GUILayout.Button("Clear"))
             {
-                isSelectingArea = true;
+                ClearSelection();
             }
+        }
+        EditorGUILayout.EndHorizontal();
+
+        if (selectingFirstPoint)
+        {
+            EditorGUILayout.HelpBox("Click the first corner on the capture in Scene view.", MessageType.Info);
+        }
+        else if (selectingSecondPoint)
+        {
+            EditorGUILayout.HelpBox("Click the opposite corner on the capture in Scene view.", MessageType.Info);
+        }
+        else if (hasSelection)
+        {
+            EditorGUILayout.LabelField("Area selected.", EditorStyles.miniLabel);
         }
         else
         {
-            if (GUILayout.Button("Cancel Selection"))
-            {
-                isSelectingArea = false;
-            }
-        }
-
-        if (GUILayout.Button("Clear Selection"))
-        {
-            ResetSelection();
-        }
-
-        GUILayout.EndArea();
-        Handles.EndGUI();
-
-        // handle scene mouse events for picking points
-        Event e = Event.current;
-        if (isSelectingArea && e.type == EventType.MouseDown && e.button == 0 && !e.alt)
-        {
-            Ray worldRay = HandleUtility.GUIPointToWorldRay(e.mousePosition);
-            if (referenceMesh != null)
-            {
-                // raycast against mesh colliders under referenceMesh
-                MeshCollider[] cols = referenceMesh.GetComponentsInChildren<MeshCollider>(true);
-                RaycastHit bestHit = default;
-                bool hitAny = false;
-                float bestDist = float.MaxValue;
-                foreach (var mc in cols)
-                {
-                    if (mc == null) continue;
-                    if (mc.Raycast(worldRay, out RaycastHit hit, 10000f))
-                    {
-                        if (hit.distance < bestDist)
-                        {
-                            bestDist = hit.distance;
-                            bestHit = hit;
-                            hitAny = true;
-                        }
-                    }
-                }
-
-                if (hitAny)
-                {
-                    Vector3 hitPoint = bestHit.point;
-                    if (!areaPointA.Equals(Vector3.zero) && !areaPointB.Equals(Vector3.zero) && !isSelectingArea)
-                    {
-                        // noop
-                    }
-
-                    // first click sets A, second click sets B and finishes selection
-                    if (areaPointA == Vector3.zero)
-                    {
-                        areaPointA = hitPoint;
-                        e.Use();
-                    }
-                    else
-                    {
-                        areaPointB = hitPoint;
-                        // finalize bounds
-                        areaMinX = Mathf.Min(areaPointA.x, areaPointB.x);
-                        areaMaxX = Mathf.Max(areaPointA.x, areaPointB.x);
-                        areaMinZ = Mathf.Min(areaPointA.z, areaPointB.z);
-                        areaMaxZ = Mathf.Max(areaPointA.z, areaPointB.z);
-                        isSelectingArea = false;
-                        useSelectionArea = true;
-                        hasValidSelection = true;
-                        e.Use();
-                    }
-                }
-            }
-        }
-
-        // draw selection rectangle if defined
-        if (useSelectionArea && !(areaMinX == 0f && areaMaxX == 0f && areaMinZ == 0f && areaMaxZ == 0f))
-        {
-            Vector3 a = new Vector3(areaMinX, terrain != null ? terrain.transform.position.y + terrain.terrainData.size.y + 1f : 0f, areaMinZ);
-            Vector3 b = new Vector3(areaMaxX, terrain != null ? terrain.transform.position.y + terrain.terrainData.size.y + 1f : 0f, areaMinZ);
-            Vector3 c = new Vector3(areaMaxX, terrain != null ? terrain.transform.position.y + terrain.terrainData.size.y + 1f : 0f, areaMaxZ);
-            Vector3 d = new Vector3(areaMinX, terrain != null ? terrain.transform.position.y + terrain.terrainData.size.y + 1f : 0f, areaMaxZ);
-            Handles.color = new Color(1f, 0f, 0f, 0.25f);
-            Handles.DrawSolidRectangleWithOutline(new Vector3[] { a, b, c, d }, new Color(1f, 0f, 0f, 0.1f), Color.red);
+            EditorGUILayout.HelpBox("Pick an area before copying, or disable this option to copy the whole terrain.", MessageType.Warning);
         }
     }
 
-    void CopyHeights()
+    private void OnSceneGUI(SceneView sceneView)
     {
-        if (terrain == null || referenceMesh == null)
+        if (!useSelectionArea)
         {
-            Debug.LogError("TerrainSnap: Assign both Terrain and Reference Mesh Root.");
             return;
         }
 
-        TerrainData data = terrain.terrainData;
-        if (data == null)
+        Event currentEvent = Event.current;
+        if ((selectingFirstPoint || selectingSecondPoint) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0 && !currentEvent.alt)
         {
-            Debug.LogError("TerrainSnap: Assigned Terrain has no TerrainData.");
-            return;
-        }
-
-        Undo.RegisterCompleteObjectUndo(data, "Terrain Snap");
-
-        int resolution = data.heightmapResolution;
-        float[,] heights = data.GetHeights(0, 0, resolution, resolution);
-
-        Vector3 terrainPos = terrain.transform.position;
-        Vector3 terrainSize = data.size;
-
-        MeshCollider[] colliders = referenceMesh.GetComponentsInChildren<MeshCollider>(true);
-        if (colliders.Length == 0)
-        {
-            Debug.LogError("TerrainSnap: No MeshColliders found under Reference Mesh Root.");
-            return;
-        }
-
-        int step = Mathf.Max(1, sampleStep);
-        int sampledCount = 0;
-
-        try // noop
-        {
-            for (int z = 0; z < resolution; z += step)
+            if (TryPickReferencePoint(currentEvent.mousePosition, out Vector3 point))
             {
-                EditorUtility.DisplayProgressBar("Copying Heights", $"Processing row {z}/{resolution}...", (float)z / resolution);
-
-                for (int x = 0; x < resolution; x += step)
+                if (selectingFirstPoint)
                 {
-                    // world position for this heightmap sample
-                    float nx = x / (float)(resolution - 1);
-                    float nz = z / (float)(resolution - 1);
-                    float worldX = terrainPos.x + nx * terrainSize.x;
-                    float worldZ = terrainPos.z + nz * terrainSize.z;
-
-                    // selection area test
-                    if (useSelectionArea && !(worldX >= areaMinX && worldX <= areaMaxX && worldZ >= areaMinZ && worldZ <= areaMaxZ))
-                        continue;
-
-                    Vector3 rayOrigin = new Vector3(worldX, terrainPos.y + rayHeight, worldZ);
-                    Ray ray = new Ray(rayOrigin, Vector3.down);
-
-                    // perform a non-alloc raycast for all hits
-                    int hitCount = Physics.RaycastNonAlloc(ray, hitsBuffer, rayHeight * 2f);
-                    if (hitCount == 0) continue;
-
-                    float bestNormalized = float.MaxValue; // choose lowest valid hit
-                    bool anyValid = false;
-
-                    // iterate hits and evaluate candidates
-                    for (int hi = 0; hi < hitCount; hi++)
-                    {
-                        RaycastHit rh = hitsBuffer[hi];
-                        if (rh.collider == null) continue;
-
-                        // only consider colliders that belong to the reference mesh set
-                        bool belongs = false;
-                        for (int ci = 0; ci < colliders.Length; ci++)
-                        {
-                            if (colliders[ci] == null) continue;
-                            if (rh.collider == colliders[ci]) { belongs = true; break; }
-                        }
-                        if (!belongs) continue;
-
-                        // ignore disabled or trigger colliders
-                        if (!rh.collider.enabled) continue;
-                        if (rh.collider.isTrigger) continue;
-
-                        // ignore steep surfaces
-                        float angle = Vector3.Angle(rh.normal, Vector3.up);
-                        if (angle > MaxSlope) // too steep
-                        {
-                            if (DebugDraw) Debug.DrawRay(rayOrigin, Vector3.down * rh.distance, Color.red, 1f);
-                            continue;
-                        }
-
-                        // thickness test: cast a short ray starting slightly above the hit, measure if object is thin
-                        bool thin = false;
-                        Vector3 thicknessStart = rh.point + Vector3.up * 0.01f;
-                        int tHits = Physics.RaycastNonAlloc(new Ray(thicknessStart, Vector3.down), thicknessBuffer, MinObjectThickness + 0.01f);
-                        if (tHits == 0)
-                        {
-                            // no nearby geometry within MinObjectThickness -> likely thin/isolated
-                            thin = true;
-                        }
-                        else
-                        {
-                            // if the closest thickness hit is far (> MinObjectThickness) consider thin
-                            float minT = float.MaxValue;
-                            for (int ti = 0; ti < tHits; ti++)
-                            {
-                                if (thicknessBuffer[ti].collider == null) continue;
-                                if (thicknessBuffer[ti].distance < minT) minT = thicknessBuffer[ti].distance;
-                            }
-                            if (minT > MinObjectThickness) thin = true;
-                        }
-
-                        if (thin)
-                        {
-                            if (DebugDraw) Debug.DrawRay(rayOrigin, Vector3.down * rh.distance, Color.red, 1f);
-                            continue;
-                        }
-
-                        // spike detection: compare to neighbouring terrain heights
-                        float sum = 0f; int cnt = 0;
-                        int r = Mathf.Max(1, NeighbourRadius);
-                        for (int oy = -r; oy <= r; oy++)
-                        {
-                            int yy = z + oy * step;
-                            if (yy < 0 || yy >= resolution) continue;
-                            for (int ox = -r; ox <= r; ox++)
-                            {
-                                int xx = x + ox * step;
-                                if (xx < 0 || xx >= resolution) continue;
-                                sum += heights[yy, xx] * terrainSize.y + terrainPos.y;
-                                cnt++;
-                            }
-                        }
-                        float neighborAvg = cnt > 0 ? sum / cnt : (terrainPos.y + heights[z, x] * terrainSize.y);
-                        float worldHeight = rh.point.y;
-                        if (worldHeight - neighborAvg > SpikeHeightThreshold)
-                        {
-                            if (DebugDraw) Debug.DrawRay(rayOrigin, Vector3.down * rh.distance, Color.red, 1f);
-                            continue;
-                        }
-
-                        // candidate is valid; take lowest normalized height
-                        float normalized = (worldHeight - terrainPos.y) / terrainSize.y;
-                        normalized = Mathf.Clamp01(normalized);
-                        if (!anyValid || normalized < bestNormalized)
-                        {
-                            bestNormalized = normalized;
-                            anyValid = true;
-                        }
-
-                        if (DebugDraw) Debug.DrawRay(rayOrigin, Vector3.down * rh.distance, Color.green, 1f);
-                    }
-
-                    if (anyValid)
-                    {
-                        float blended = Mathf.Lerp(heights[z, x], bestNormalized, blend);
-                        heights[z, x] = blended;
-                        sampledCount++;
-
-                        // fill skipped cells for step > 1
-                        if (step > 1)
-                        {
-                            for (int dz = 0; dz < step && (z + dz) < resolution; dz++)
-                            {
-                                for (int dx = 0; dx < step && (x + dx) < resolution; dx++)
-                                {
-                                    heights[z + dz, x + dx] = blended;
-                                }
-                            }
-                        }
-                    }
+                    selectionPointA = point;
+                    selectingFirstPoint = false;
+                    selectingSecondPoint = true;
                 }
+                else
+                {
+                    selectionPointB = point;
+                    selectingSecondPoint = false;
+                    hasSelection = true;
+                }
+
+                currentEvent.Use();
+                Repaint();
+                SceneView.RepaintAll();
+            }
+        }
+
+        if (hasSelection)
+        {
+            DrawSelectionRectangle();
+        }
+    }
+
+    private bool TryPickReferencePoint(Vector2 mousePosition, out Vector3 point)
+    {
+        point = default;
+        if (referenceMesh == null)
+        {
+            return false;
+        }
+
+        Ray ray = HandleUtility.GUIPointToWorldRay(mousePosition);
+        MeshCollider[] colliders = referenceMesh.GetComponentsInChildren<MeshCollider>(true);
+        float closestDistance = float.MaxValue;
+        bool found = false;
+
+        for (int index = 0; index < colliders.Length; index++)
+        {
+            MeshCollider collider = colliders[index];
+            if (collider != null && collider.enabled && collider.Raycast(ray, out RaycastHit hit, 10000f) && hit.distance < closestDistance)
+            {
+                closestDistance = hit.distance;
+                point = hit.point;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    private void DrawSelectionRectangle()
+    {
+        float y = terrain == null ? 0f : terrain.transform.position.y + terrain.terrainData.size.y + 1f;
+        float minX = Mathf.Min(selectionPointA.x, selectionPointB.x);
+        float maxX = Mathf.Max(selectionPointA.x, selectionPointB.x);
+        float minZ = Mathf.Min(selectionPointA.z, selectionPointB.z);
+        float maxZ = Mathf.Max(selectionPointA.z, selectionPointB.z);
+
+        Vector3[] corners =
+        {
+            new Vector3(minX, y, minZ), new Vector3(maxX, y, minZ),
+            new Vector3(maxX, y, maxZ), new Vector3(minX, y, maxZ)
+        };
+        Handles.DrawSolidRectangleWithOutline(corners, new Color(1f, 0.1f, 0.1f, 0.08f), Color.red);
+    }
+
+    private void CopyHeights()
+    {
+        if (!ValidateInputs(out TerrainData terrainData))
+        {
+            return;
+        }
+
+        CacheSourceColliders();
+        if (sourceColliders.Count == 0)
+        {
+            Debug.LogError("Terrain Snap: No enabled MeshColliders were found below Reference Mesh Root.");
+            return;
+        }
+
+        Physics.SyncTransforms();
+
+        int resolution = terrainData.heightmapResolution;
+        float[,] originalHeights = terrainData.GetHeights(0, 0, resolution, resolution);
+        float[,] sampledHeights = new float[resolution, resolution];
+        bool[,] sampledMask = new bool[resolution, resolution];
+
+        Vector3 terrainPosition = terrain.transform.position;
+        Vector3 terrainSize = terrainData.size;
+        int step = Mathf.Max(1, sampleStep);
+        bool raycastBufferOverflowed = false;
+
+        try
+        {
+            if (!SampleCapture(resolution, terrainPosition, terrainSize, step, sampledHeights, sampledMask, ref raycastBufferOverflowed))
+            {
+                return;
             }
 
-            // write heights back
-            data.SetHeights(0, 0, heights);
+            float[,] cleanedHeights = removeUpwardSpikes
+                ? RemoveIsolatedUpwardSpikes(sampledHeights, sampledMask, terrainSize.y, step)
+                : sampledHeights;
 
-            if (smoothAfter) Smooth(data);
+            float[,] result = ApplySamples(originalHeights, cleanedHeights, sampledMask);
+            if (smoothAfter)
+            {
+                result = SmoothChangedSamples(result, sampledMask);
+            }
+
+            Undo.RegisterCompleteObjectUndo(terrainData, "Terrain Snap");
+            terrainData.SetHeights(0, 0, result);
+            EditorUtility.SetDirty(terrainData);
+
+            Debug.Log($"Terrain Snap: copied {CountSamples(sampledMask)} height samples from {sourceColliders.Count} source colliders." +
+                (raycastBufferOverflowed ? " Some rays exceeded the 128-hit buffer; use a capture-only physics layer if artifacts remain." : string.Empty));
         }
         finally
         {
             EditorUtility.ClearProgressBar();
         }
-
-        Debug.Log($"TerrainSnap: Complete. Sampled {sampledCount} cells from {colliders.Length} colliders.");
     }
 
-    // Simple smoothing pass (box blur)
-    void Smooth(TerrainData data)
+    private bool SampleCapture(int resolution, Vector3 terrainPosition, Vector3 terrainSize, int step, float[,] sampledHeights, bool[,] sampledMask, ref bool raycastBufferOverflowed)
     {
-        int res = data.heightmapResolution;
-        float[,] h = data.GetHeights(0, 0, res, res);
-        float[,] outH = new float[res, res];
-
-        for (int y = 0; y < res; y++)
+        for (int z = 0; z < resolution; z += step)
         {
-            for (int x = 0; x < res; x++)
+            if (EditorUtility.DisplayCancelableProgressBar("Terrain Snap", $"Sampling row {z + 1} of {resolution}", z / (float)(resolution - 1)))
             {
-                float sum = 0f; int count = 0;
-                for (int oy = -1; oy <= 1; oy++)
+                Debug.Log("Terrain Snap: cancelled before any terrain changes were applied.");
+                return false;
+            }
+
+            for (int x = 0; x < resolution; x += step)
+            {
+                float worldX = terrainPosition.x + x / (float)(resolution - 1) * terrainSize.x;
+                float worldZ = terrainPosition.z + z / (float)(resolution - 1) * terrainSize.z;
+                if (!IsInsideSelection(worldX, worldZ))
                 {
-                    for (int ox = -1; ox <= 1; ox++)
-                    {
-                        int nx = Mathf.Clamp(x + ox, 0, res - 1);
-                        int ny = Mathf.Clamp(y + oy, 0, res - 1);
-                        sum += h[ny, nx]; count++;
-                    }
+                    continue;
                 }
-                outH[y, x] = sum / count;
+
+                Ray ray = new Ray(new Vector3(worldX, terrainPosition.y + rayHeight, worldZ), Vector3.down);
+                int hitCount = Physics.RaycastNonAlloc(ray, raycastBuffer, rayHeight * 2f, ~0, QueryTriggerInteraction.Ignore);
+                if (hitCount == raycastBuffer.Length)
+                {
+                    raycastBufferOverflowed = true;
+                }
+
+                if (!TryGetLowestSourceSurface(hitCount, terrainPosition.y, terrainSize.y, out float normalizedHeight))
+                {
+                    continue;
+                }
+
+                FillSampleBlock(x, z, step, normalizedHeight, sampledHeights, sampledMask);
             }
         }
 
-        data.SetHeights(0, 0, outH);
+        return true;
     }
 
-    private void ResetSelection()
+    private bool TryGetLowestSourceSurface(int hitCount, float terrainBaseY, float terrainHeight, out float normalizedHeight)
     {
-        isSelectingArea = false;
-        hasValidSelection = false;
-        areaPointA = Vector3.zero;
-        areaPointB = Vector3.zero;
-        areaMinX = areaMaxX = areaMinZ = areaMaxZ = 0f;
-        useSelectionArea = false;
+        normalizedHeight = 0f;
+        bool found = false;
+        float lowestHeight = float.MaxValue;
+
+        for (int index = 0; index < hitCount; index++)
+        {
+            RaycastHit hit = raycastBuffer[index];
+            if (hit.collider == null || !sourceColliders.Contains(hit.collider))
+            {
+                continue;
+            }
+
+            // A nearly vertical triangle is a wall, fence, pole or scan artifact—not terrain.
+            if (Vector3.Angle(hit.normal, Vector3.up) > 80f)
+            {
+                continue;
+            }
+
+            if (hit.point.y < lowestHeight)
+            {
+                lowestHeight = hit.point.y;
+                found = true;
+            }
+        }
+
+        if (found)
+        {
+            normalizedHeight = Mathf.Clamp01((lowestHeight - terrainBaseY) / terrainHeight);
+        }
+
+        return found;
+    }
+
+    private float[,] RemoveIsolatedUpwardSpikes(float[,] samples, bool[,] mask, float terrainHeight, int step)
+    {
+        int resolution = samples.GetLength(0);
+        float[,] filtered = (float[,])samples.Clone();
+        int radius = Mathf.Max(1, spikeNeighbourRadius * step);
+        float[] neighbourValues = new float[(spikeNeighbourRadius * 2 + 1) * (spikeNeighbourRadius * 2 + 1)];
+
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                if (!mask[z, x])
+                {
+                    continue;
+                }
+
+                int count = CollectNeighbourHeights(samples, mask, x, z, radius, neighbourValues);
+                if (count < 3)
+                {
+                    continue;
+                }
+
+                Array.Sort(neighbourValues, 0, count);
+                float median = neighbourValues[count / 2];
+                if ((samples[z, x] - median) * terrainHeight > spikeHeightThreshold)
+                {
+                    filtered[z, x] = median;
+                }
+            }
+        }
+
+        return filtered;
+    }
+
+    private int CollectNeighbourHeights(float[,] samples, bool[,] mask, int centerX, int centerZ, int radius, float[] values)
+    {
+        int resolution = samples.GetLength(0);
+        int count = 0;
+        for (int z = Mathf.Max(0, centerZ - radius); z <= Mathf.Min(resolution - 1, centerZ + radius); z += Mathf.Max(1, sampleStep))
+        {
+            for (int x = Mathf.Max(0, centerX - radius); x <= Mathf.Min(resolution - 1, centerX + radius); x += Mathf.Max(1, sampleStep))
+            {
+                if ((x == centerX && z == centerZ) || !mask[z, x])
+                {
+                    continue;
+                }
+
+                values[count++] = samples[z, x];
+            }
+        }
+
+        return count;
+    }
+
+    private float[,] ApplySamples(float[,] original, float[,] sampled, bool[,] mask)
+    {
+        int resolution = original.GetLength(0);
+        float[,] result = (float[,])original.Clone();
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                if (mask[z, x])
+                {
+                    result[z, x] = Mathf.Lerp(original[z, x], sampled[z, x], blend);
+                }
+            }
+        }
+        return result;
+    }
+
+    private float[,] SmoothChangedSamples(float[,] heights, bool[,] mask)
+    {
+        int resolution = heights.GetLength(0);
+        float[,] smoothed = (float[,])heights.Clone();
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                if (!mask[z, x])
+                {
+                    continue;
+                }
+
+                float sum = 0f;
+                int count = 0;
+                for (int offsetZ = -1; offsetZ <= 1; offsetZ++)
+                {
+                    for (int offsetX = -1; offsetX <= 1; offsetX++)
+                    {
+                        int neighbourX = Mathf.Clamp(x + offsetX, 0, resolution - 1);
+                        int neighbourZ = Mathf.Clamp(z + offsetZ, 0, resolution - 1);
+                        sum += heights[neighbourZ, neighbourX];
+                        count++;
+                    }
+                }
+                smoothed[z, x] = sum / count;
+            }
+        }
+        return smoothed;
+    }
+
+    private void FillSampleBlock(int startX, int startZ, int step, float height, float[,] samples, bool[,] mask)
+    {
+        int resolution = samples.GetLength(0);
+        for (int z = startZ; z < Mathf.Min(startZ + step, resolution); z++)
+        {
+            for (int x = startX; x < Mathf.Min(startX + step, resolution); x++)
+            {
+                float worldX = terrain.transform.position.x + x / (float)(resolution - 1) * terrain.terrainData.size.x;
+                float worldZ = terrain.transform.position.z + z / (float)(resolution - 1) * terrain.terrainData.size.z;
+                if (IsInsideSelection(worldX, worldZ))
+                {
+                    samples[z, x] = height;
+                    mask[z, x] = true;
+                }
+            }
+        }
+    }
+
+    private void CacheSourceColliders()
+    {
+        sourceColliders.Clear();
+        MeshCollider[] colliders = referenceMesh.GetComponentsInChildren<MeshCollider>(true);
+        for (int index = 0; index < colliders.Length; index++)
+        {
+            MeshCollider collider = colliders[index];
+            if (collider != null && collider.enabled && !collider.isTrigger)
+            {
+                sourceColliders.Add(collider);
+            }
+        }
+    }
+
+    private bool IsInsideSelection(float worldX, float worldZ)
+    {
+        if (!useSelectionArea)
+        {
+            return true;
+        }
+
+        float minX = Mathf.Min(selectionPointA.x, selectionPointB.x);
+        float maxX = Mathf.Max(selectionPointA.x, selectionPointB.x);
+        float minZ = Mathf.Min(selectionPointA.z, selectionPointB.z);
+        float maxZ = Mathf.Max(selectionPointA.z, selectionPointB.z);
+        return hasSelection && worldX >= minX && worldX <= maxX && worldZ >= minZ && worldZ <= maxZ;
+    }
+
+    private bool ValidateInputs(out TerrainData terrainData)
+    {
+        terrainData = terrain == null ? null : terrain.terrainData;
+        if (terrain == null || referenceMesh == null || terrainData == null)
+        {
+            Debug.LogError("Terrain Snap: Assign a Terrain and a Reference Mesh Root with MeshColliders.");
+            return false;
+        }
+
+        return true;
+    }
+
+    private static int CountSamples(bool[,] mask)
+    {
+        int count = 0;
+        foreach (bool value in mask)
+        {
+            if (value)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private void ClearSelection()
+    {
+        selectingFirstPoint = false;
+        selectingSecondPoint = false;
+        hasSelection = false;
+        selectionPointA = default;
+        selectionPointB = default;
+        SceneView.RepaintAll();
     }
 }
