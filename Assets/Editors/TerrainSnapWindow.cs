@@ -560,14 +560,78 @@ public class TerrainSnapWindow : EditorWindow
                 return;
             }
 
+            // Initial cleanup of sampled data (spikes)
             float[,] cleanedHeights = removeUpwardSpikes
                 ? RemoveIsolatedUpwardSpikes(sampledHeights, sampledMask, terrainSize.y, step)
                 : sampledHeights;
 
-            float[,] result = ApplySamples(originalHeights, cleanedHeights, sampledMask);
+            // Apply painted masks (if any) and enforce Ignore semantics: any sample under Ignore is discarded.
+            byte[,] maskMap = terrainMask;
+            if (maskMap != null && (maskMap.GetLength(0) != resolution || maskMap.GetLength(1) != resolution))
+            {
+                // Mask dimensions do not match heightmap; ignore masks to preserve compatibility.
+                maskMap = null;
+            }
+
+            if (maskMap != null)
+            {
+                for (int z = 0; z < resolution; z++)
+                {
+                    for (int x = 0; x < resolution; x++)
+                    {
+                        if ((MaskType)maskMap[z, x] == MaskType.Ignore && sampledMask[z, x])
+                        {
+                            // Painted Ignore must never supply a sample
+                            sampledMask[z, x] = false;
+                        }
+                    }
+                }
+            }
+
+            // Reconstruct ignored areas driven by painted masks.
+            ReconstructMaskedAreas(cleanedHeights, sampledMask, originalHeights, maskMap, terrainSize.y, out float[,] reconstructedHeights, out bool[,] reconstructedMask);
+
+            // Build final result by orchestrating anchors, sampled values and reconstructed pixels.
+            float[,] result = (float[,])originalHeights.Clone();
+            for (int z = 0; z < resolution; z++)
+            {
+                for (int x = 0; x < resolution; x++)
+                {
+                    MaskType m = maskMap == null ? MaskType.Unknown : (MaskType)maskMap[z, x];
+
+                    // Ground pixels are hard constraints: prefer sampled height if present, otherwise keep original.
+                    if (m == MaskType.Ground)
+                    {
+                        if (sampledMask[z, x])
+                        {
+                            result[z, x] = cleanedHeights[z, x];
+                        }
+                        else
+                        {
+                            result[z, x] = originalHeights[z, x];
+                        }
+                        continue;
+                    }
+
+                    // Reconstructed pixels come from the solver. Blend them into the terrain by the user blend slider.
+                    if (reconstructedMask[z, x])
+                    {
+                        result[z, x] = Mathf.Lerp(originalHeights[z, x], reconstructedHeights[z, x], blend);
+                        continue;
+                    }
+
+                    // Sampled pixels (Reference or Unknown) behave like before: blend sample into original.
+                    if (sampledMask[z, x])
+                    {
+                        result[z, x] = Mathf.Lerp(originalHeights[z, x], cleanedHeights[z, x], blend);
+                    }
+                }
+            }
+
+            // Edge-preserving smoothing only inside reconstructed pixels (if requested).
             if (smoothAfter)
             {
-                result = SmoothChangedSamples(result, sampledMask);
+                result = SmoothReconstructedPixels(result, reconstructedMask, maskMap, terrainSize.y);
             }
 
             Undo.RegisterCompleteObjectUndo(terrainData, "Terrain Snap");
@@ -581,6 +645,264 @@ public class TerrainSnapWindow : EditorWindow
         {
             EditorUtility.ClearProgressBar();
         }
+    }
+
+    /// <summary>
+    /// Reconstructs painted Ignore regions using surrounding Ground and Reference anchors.
+    /// Produces per-pixel reconstructed heights and a mask of pixels that were reconstructed.
+    /// The algorithm is intentionally simple (distance-weighted interpolation) and isolated so it can be replaced later.
+    /// </summary>
+    private void ReconstructMaskedAreas(float[,] sampledHeights, bool[,] sampledMask, float[,] originalHeights, byte[,] maskMap, float terrainHeightMeters, out float[,] reconstructedHeights, out bool[,] reconstructedMask)
+    {
+        int resolution = originalHeights.GetLength(0);
+        reconstructedHeights = (float[,])originalHeights.Clone();
+        reconstructedMask = new bool[resolution, resolution];
+
+        if (maskMap == null)
+        {
+            // No painted masks -> nothing to reconstruct.
+            return;
+        }
+
+        bool[,] visited = new bool[resolution, resolution];
+        int[] dirX = { -1, 0, 1, -1, 1, -1, 0, 1 };
+        int[] dirZ = { -1, -1, -1, 0, 0, 1, 1, 1 };
+
+        for (int startZ = 0; startZ < resolution; startZ++)
+        {
+            for (int startX = 0; startX < resolution; startX++)
+            {
+                if (visited[startZ, startX])
+                {
+                    continue;
+                }
+
+                if ((MaskType)maskMap[startZ, startX] != MaskType.Ignore)
+                {
+                    visited[startZ, startX] = true;
+                    continue;
+                }
+
+                // Flood-fill connected Ignore region
+                List<Vector2Int> region = new List<Vector2Int>();
+                Queue<Vector2Int> q = new Queue<Vector2Int>();
+                q.Enqueue(new Vector2Int(startX, startZ));
+                visited[startZ, startX] = true;
+
+                while (q.Count > 0)
+                {
+                    Vector2Int p = q.Dequeue();
+                    region.Add(p);
+
+                    for (int d = 0; d < 8; d++)
+                    {
+                        int nx = p.x + dirX[d];
+                        int nz = p.y + dirZ[d];
+                        if (nx < 0 || nx >= resolution || nz < 0 || nz >= resolution) continue;
+                        if (visited[nz, nx]) continue;
+                        if ((MaskType)maskMap[nz, nx] == MaskType.Ignore)
+                        {
+                            visited[nz, nx] = true;
+                            q.Enqueue(new Vector2Int(nx, nz));
+                        }
+                    }
+                }
+
+                // Collect anchor points (Ground and Reference) surrounding this region.
+                List<(int x, int z, float height, float weight)> anchors = new List<(int, int, float, float)>();
+                int padding = Mathf.Max(1, sampleStep * 3);
+                int minX = resolution, minZ = resolution, maxX = 0, maxZ = 0;
+                foreach (var p in region)
+                {
+                    minX = Mathf.Min(minX, p.x);
+                    maxX = Mathf.Max(maxX, p.x);
+                    minZ = Mathf.Min(minZ, p.y);
+                    maxZ = Mathf.Max(maxZ, p.y);
+                }
+
+                minX = Mathf.Max(0, minX - padding);
+                minZ = Mathf.Max(0, minZ - padding);
+                maxX = Mathf.Min(resolution - 1, maxX + padding);
+                maxZ = Mathf.Min(resolution - 1, maxZ + padding);
+
+                for (int z = minZ; z <= maxZ; z++)
+                {
+                    for (int x = minX; x <= maxX; x++)
+                    {
+                        MaskType mt = (MaskType)maskMap[z, x];
+                        if (mt == MaskType.Ground || mt == MaskType.Reference)
+                        {
+                            float h = sampledMask[z, x] ? sampledHeights[z, x] : originalHeights[z, x];
+                            float w = mt == MaskType.Ground ? 3f : 1f; // Ground anchors are stronger
+                            anchors.Add((x, z, h, w));
+                        }
+                    }
+                }
+
+                if (anchors.Count == 0)
+                {
+                    // Nothing to anchor to; skip this region to preserve existing terrain.
+                    continue;
+                }
+
+                // For each pixel in the region, estimate height using distance-weighted interpolation.
+                const float power = 1.5f; // IDW power. Tunable and replaceable.
+                foreach (var p in region)
+                {
+                    double sum = 0.0;
+                    double wsum = 0.0;
+                    for (int i = 0; i < anchors.Count; i++)
+                    {
+                        var a = anchors[i];
+                        float dx = a.x - p.x;
+                        float dz = a.z - p.y;
+                        float dist = Mathf.Sqrt(dx * dx + dz * dz);
+                        // Use pixel-space distance with small offset to avoid singularities.
+                        float d = Mathf.Max(1e-4f, dist);
+                        double w = a.weight / Math.Pow(d, power);
+                        sum += w * a.height;
+                        wsum += w;
+                    }
+
+                    float estimate = wsum > 0.0 ? (float)(sum / wsum) : originalHeights[p.y, p.x];
+                    reconstructedHeights[p.y, p.x] = estimate;
+                    reconstructedMask[p.y, p.x] = true;
+                }
+
+                // Small smoothing inside this reconstructed region to remove artefacts but preserve anchors.
+                // We do this per-region to keep the operation local and predictable.
+                ApplyLocalSmoothing(reconstructedHeights, reconstructedMask, region, terrainHeightMeters);
+            }
+        }
+    }
+
+    // Small, edge-aware smoothing applied only to reconstructed pixels inside the provided region.
+    // Anchors (Ground/Reference) are not modified here; only reconstructed pixels are adjusted.
+    private void ApplyLocalSmoothing(float[,] heights, bool[,] reconstructedMask, List<Vector2Int> region, float terrainHeightMeters)
+    {
+        int resolution = heights.GetLength(0);
+        float[,] copy = (float[,])heights.Clone();
+        int iterations = 2;
+        float sigmaMeters = 1.0f; // bilateral range sigma in metres
+        float pixelSizeX = terrain == null ? 1f : terrain.terrainData.size.x / (resolution - 1);
+        float pixelSizeZ = terrain == null ? 1f : terrain.terrainData.size.z / (resolution - 1);
+
+        HashSet<long> regionSet = new HashSet<long>();
+        foreach (var p in region)
+        {
+            regionSet.Add(((long)p.y << 32) | (uint)p.x);
+        }
+
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            foreach (var p in region)
+            {
+                int x = p.x; int z = p.y;
+                if (!reconstructedMask[z, x]) continue;
+
+                double sum = 0.0; double wsum = 0.0;
+                for (int oz = -1; oz <= 1; oz++)
+                {
+                    for (int ox = -1; ox <= 1; ox++)
+                    {
+                        int nx = Mathf.Clamp(x + ox, 0, resolution - 1);
+                        int nz = Mathf.Clamp(z + oz, 0, resolution - 1);
+                        if (!reconstructedMask[nz, nx])
+                        {
+                            // Allow using anchored neighbours as reference but do not modify them.
+                            // Anchors are not in reconstructedMask.
+                        }
+
+                        float hCenter = copy[z, x] * terrainHeightMeters;
+                        float hNeighbor = copy[nz, nx] * terrainHeightMeters;
+                        float rangeDiff = hNeighbor - hCenter;
+                        float rangeWeight = Mathf.Exp(-(rangeDiff * rangeDiff) / (2f * sigmaMeters * sigmaMeters));
+                        float spatialDist = Mathf.Sqrt((ox * ox) * (pixelSizeX * pixelSizeX) + (oz * oz) * (pixelSizeZ * pixelSizeZ));
+                        float spatialWeight = 1f / (1f + spatialDist);
+                        float w = spatialWeight * rangeWeight;
+                        sum += w * copy[nz, nx];
+                        wsum += w;
+                    }
+                }
+
+                if (wsum > 0.0)
+                {
+                    heights[z, x] = (float)(sum / wsum);
+                }
+            }
+            // copy back for next iteration
+            Array.Copy(heights, copy, heights.Length);
+        }
+    }
+
+    // Smooth only inside reconstructed pixels using an edge-preserving bilateral-like filter.
+    private float[,] SmoothReconstructedPixels(float[,] heights, bool[,] reconstructedMask, byte[,] maskMap, float terrainHeightMeters)
+    {
+        if (reconstructedMask == null) return heights;
+        int resolution = heights.GetLength(0);
+        float[,] copy = (float[,])heights.Clone();
+        int iterations = 2;
+        float sigmaMeters = 1.0f;
+        float pixelSizeX = terrain == null ? 1f : terrain.terrainData.size.x / (resolution - 1);
+        float pixelSizeZ = terrain == null ? 1f : terrain.terrainData.size.z / (resolution - 1);
+
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            for (int z = 0; z < resolution; z++)
+            {
+                for (int x = 0; x < resolution; x++)
+                {
+                    if (!reconstructedMask[z, x]) continue;
+                    // Never move Ground anchors.
+                    if (maskMap != null && (MaskType)maskMap[z, x] == MaskType.Ground) continue;
+
+                    double sum = 0.0; double wsum = 0.0;
+                    float centerH = copy[z, x] * terrainHeightMeters;
+                    for (int oz = -1; oz <= 1; oz++)
+                    {
+                        for (int ox = -1; ox <= 1; ox++)
+                        {
+                            int nx = Mathf.Clamp(x + ox, 0, resolution - 1);
+                            int nz = Mathf.Clamp(z + oz, 0, resolution - 1);
+
+                            float neighH = copy[nz, nx] * terrainHeightMeters;
+                            float rangeDiff = neighH - centerH;
+                            float rangeWeight = Mathf.Exp(-(rangeDiff * rangeDiff) / (2f * sigmaMeters * sigmaMeters));
+                            float spatialDist = Mathf.Sqrt((ox * ox) * (pixelSizeX * pixelSizeX) + (oz * oz) * (pixelSizeZ * pixelSizeZ));
+                            float spatialWeight = 1f / (1f + spatialDist);
+                            float w = spatialWeight * rangeWeight;
+                            sum += w * copy[nz, nx];
+                            wsum += w;
+                        }
+                    }
+
+                    if (wsum > 0.0)
+                    {
+                        heights[z, x] = (float)(sum / wsum);
+                    }
+                }
+            }
+            Array.Copy(heights, copy, heights.Length);
+        }
+
+        return heights;
+    }
+
+    private float[,] ApplySamples(float[,] original, float[,] sampled, bool[,] mask)
+    {
+        int resolution = original.GetLength(0);
+        float[,] result = (float[,])original.Clone();
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                if (mask[z, x])
+                {
+                    result[z, x] = Mathf.Lerp(original[z, x], sampled[z, x], blend);
+                }
+            }
+        }
+        return result;
     }
 
     private bool SampleCapture(int resolution, Vector3 terrainPosition, Vector3 terrainSize, int step, float[,] sampledHeights, bool[,] sampledMask, ref bool raycastBufferOverflowed)
