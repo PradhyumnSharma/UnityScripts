@@ -9,6 +9,16 @@ using UnityEngine;
 /// </summary>
 public class TerrainSnapWindow : EditorWindow
 {
+    /// <summary>
+    /// Mask types for terrain sample classification during painting.
+    /// </summary>
+    private enum MaskType : byte
+    {
+        Unknown = 0,
+        Ground = 1,
+        Reference = 2,
+        Ignore = 3
+    }
     [SerializeField] private Terrain terrain;
     [SerializeField] private GameObject referenceMesh;
     [SerializeField] private float rayHeight = 2000f;
@@ -28,6 +38,15 @@ public class TerrainSnapWindow : EditorWindow
     private bool selectingSecondPoint;
     private readonly RaycastHit[] raycastBuffer = new RaycastHit[128];
     private readonly HashSet<Collider> sourceColliders = new HashSet<Collider>();
+
+    // Mask painting system
+    [SerializeField] private bool maskPaintingEnabled;
+    [SerializeField] private float brushRadius = 5f;
+    [SerializeField, Range(0f, 1f)] private float brushStrength = 1f;
+    private MaskType currentMaskMode = MaskType.Ground;
+    private byte[,] terrainMask;
+    private bool foldoutMaskPainting;
+
 
     [MenuItem("Tools/Terrain Snap")]
     public static void ShowWindow()
@@ -74,6 +93,9 @@ public class TerrainSnapWindow : EditorWindow
 
         EditorGUILayout.Space();
         DrawSelectionControls();
+
+        EditorGUILayout.Space();
+        DrawMaskPaintingControls();
 
         EditorGUILayout.Space();
         using (new EditorGUI.DisabledScope(terrain == null || referenceMesh == null || (useSelectionArea && !hasSelection)))
@@ -131,8 +153,71 @@ public class TerrainSnapWindow : EditorWindow
         }
     }
 
+    private void DrawMaskPaintingControls()
+    {
+        foldoutMaskPainting = EditorGUILayout.Foldout(foldoutMaskPainting, "Mask Painting", true);
+        if (!foldoutMaskPainting)
+        {
+            return;
+        }
+
+        using (new EditorGUI.IndentLevelScope())
+        {
+            bool wasEnabled = maskPaintingEnabled;
+            maskPaintingEnabled = EditorGUILayout.Toggle("Enable Painting", maskPaintingEnabled);
+
+            if (maskPaintingEnabled && wasEnabled != maskPaintingEnabled && terrain != null)
+            {
+                InitializeMask();
+            }
+
+            using (new EditorGUI.DisabledScope(!maskPaintingEnabled))
+            {
+                brushRadius = Mathf.Max(0.1f, EditorGUILayout.FloatField("Brush Radius", brushRadius));
+                brushStrength = EditorGUILayout.Slider("Brush Strength", brushStrength, 0f, 1f);
+
+                EditorGUILayout.LabelField("Current Paint Mode", EditorStyles.miniLabel);
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button("Ground", GetMaskModeButtonStyle(MaskType.Ground)))
+                {
+                    currentMaskMode = MaskType.Ground;
+                }
+                if (GUILayout.Button("Reference", GetMaskModeButtonStyle(MaskType.Reference)))
+                {
+                    currentMaskMode = MaskType.Reference;
+                }
+                if (GUILayout.Button("Ignore", GetMaskModeButtonStyle(MaskType.Ignore)))
+                {
+                    currentMaskMode = MaskType.Ignore;
+                }
+                if (GUILayout.Button("Unknown (Erase)", GetMaskModeButtonStyle(MaskType.Unknown)))
+                {
+                    currentMaskMode = MaskType.Unknown;
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+        }
+    }
+
+    private GUIStyle GetMaskModeButtonStyle(MaskType mode)
+    {
+        GUIStyle style = new GUIStyle(GUI.skin.button);
+        if (currentMaskMode == mode)
+        {
+            style.normal.background = EditorGUIUtility.FindTexture("d_toggle on");
+        }
+        return style;
+    }
+
     private void OnSceneGUI(SceneView sceneView)
     {
+        // Handle mask painting first if enabled
+        if (maskPaintingEnabled && terrain != null)
+        {
+            HandleMaskPainting();
+            DrawMaskVisualization();
+        }
+
         if (!useSelectionArea)
         {
             return;
@@ -165,6 +250,237 @@ public class TerrainSnapWindow : EditorWindow
         if (hasSelection)
         {
             DrawSelectionRectangle();
+        }
+    }
+
+    private void HandleMaskPainting()
+    {
+        if (terrainMask == null)
+        {
+            return;
+        }
+
+        Event currentEvent = Event.current;
+        if (currentEvent.type == EventType.MouseMove || currentEvent.type == EventType.MouseDrag)
+        {
+            SceneView.RepaintAll();
+        }
+
+        if (currentEvent.type == EventType.MouseDrag && currentEvent.button == 0 && !currentEvent.alt)
+        {
+            Ray ray = HandleUtility.GUIPointToWorldRay(currentEvent.mousePosition);
+            if (TryGetTerrainIntersection(ray, out Vector3 paintPosition))
+            {
+                PaintMask(paintPosition, currentMaskMode);
+                currentEvent.Use();
+            }
+        }
+    }
+
+    private bool TryGetTerrainIntersection(Ray ray, out Vector3 hitPoint)
+    {
+        hitPoint = default;
+        TerrainCollider collider = terrain.GetComponent<TerrainCollider>();
+        if (collider == null || !collider.Raycast(ray, out RaycastHit hit, 10000f))
+        {
+            return false;
+        }
+
+        hitPoint = hit.point;
+        return true;
+    }
+
+    private void PaintMask(Vector3 worldPosition, MaskType maskType)
+    {
+        if (terrainMask == null || terrain == null || terrain.terrainData == null)
+        {
+            return;
+        }
+
+        TerrainData terrainData = terrain.terrainData;
+        Vector3 terrainPos = terrain.transform.position;
+        Vector3 terrainSize = terrainData.size;
+        int resolution = terrainData.heightmapResolution;
+
+        // Convert world position to terrain local coordinates
+        Vector3 localPos = worldPosition - terrainPos;
+        float normalizedX = Mathf.Clamp01(localPos.x / terrainSize.x);
+        float normalizedZ = Mathf.Clamp01(localPos.z / terrainSize.z);
+
+        // Convert to sample coordinates
+        int centerX = Mathf.RoundToInt(normalizedX * (resolution - 1));
+        int centerZ = Mathf.RoundToInt(normalizedZ * (resolution - 1));
+
+        // Apply brush with falloff
+        int brushPixelRadius = Mathf.Max(1, Mathf.RoundToInt(brushRadius / (terrainSize.x / resolution)));
+        for (int z = centerZ - brushPixelRadius; z <= centerZ + brushPixelRadius; z++)
+        {
+            if (z < 0 || z >= resolution)
+                continue;
+
+            for (int x = centerX - brushPixelRadius; x <= centerX + brushPixelRadius; x++)
+            {
+                if (x < 0 || x >= resolution)
+                    continue;
+
+                // Check if inside selection area
+                float worldX = terrainPos.x + x / (float)(resolution - 1) * terrainSize.x;
+                float worldZ = terrainPos.z + z / (float)(resolution - 1) * terrainSize.z;
+                if (!IsInsideSelection(worldX, worldZ))
+                    continue;
+
+                // Calculate distance-based falloff
+                float distX = x - centerX;
+                float distZ = z - centerZ;
+                float distSquared = distX * distX + distZ * distZ;
+                float radiusSquared = brushPixelRadius * brushPixelRadius;
+                float falloff = Mathf.Max(0f, 1f - (distSquared / (radiusSquared + 1f)));
+                float strength = brushStrength * falloff;
+
+                // Apply mask
+                if (maskType == MaskType.Unknown)
+                {
+                    terrainMask[z, x] = (byte)MaskType.Unknown;
+                }
+                else
+                {
+                    byte current = terrainMask[z, x];
+                    if (strength >= 1f || current == (byte)MaskType.Unknown)
+                    {
+                        terrainMask[z, x] = (byte)maskType;
+                    }
+                    else if (strength > 0f)
+                    {
+                        // Blend towards the new type
+                        terrainMask[z, x] = (byte)maskType;
+                    }
+                }
+            }
+        }
+    }
+
+    private void DrawMaskVisualization()
+    {
+        if (terrainMask == null || terrain == null || terrain.terrainData == null)
+        {
+            return;
+        }
+
+        TerrainData terrainData = terrain.terrainData;
+        Vector3 terrainPos = terrain.transform.position;
+        Vector3 terrainSize = terrainData.size;
+        int resolution = terrainData.heightmapResolution;
+
+        // Draw brush circle at current mouse position
+        DrawBrushCircle();
+
+        // Draw mask visualization as overlays
+        Color[] colors = new Color[resolution * resolution];
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                MaskType maskType = (MaskType)terrainMask[z, x];
+                colors[z * resolution + x] = GetMaskColor(maskType);
+            }
+        }
+
+        DrawTerrainOverlay(colors, resolution, terrainPos, terrainSize);
+    }
+
+    private void DrawBrushCircle()
+    {
+        Ray ray = HandleUtility.GUIPointToWorldRay(Event.current.mousePosition);
+        if (TryGetTerrainIntersection(ray, out Vector3 brushCenter))
+        {
+            Handles.color = new Color(1f, 1f, 1f, 0.5f);
+            Handles.DrawWireDisc(brushCenter, Vector3.up, brushRadius);
+        }
+    }
+
+    private Color GetMaskColor(MaskType maskType)
+    {
+        return maskType switch
+        {
+            MaskType.Ground => new Color(1f, 1f, 1f, 0.2f),      // White
+            MaskType.Reference => new Color(0f, 0f, 1f, 0.2f),   // Blue
+            MaskType.Ignore => new Color(1f, 0f, 0f, 0.2f),      // Red
+            MaskType.Unknown => new Color(0f, 0f, 0f, 0f),       // Transparent
+            _ => Color.clear
+        };
+    }
+
+    private void DrawTerrainOverlay(Color[] colors, int resolution, Vector3 terrainPos, Vector3 terrainSize)
+    {
+        // Draw colored quads for each sample point
+        Handles.BeginGUI();
+        for (int z = 0; z < resolution - 1; z++)
+        {
+            for (int x = 0; x < resolution - 1; x++)
+            {
+                Color avgColor = (
+                    colors[z * resolution + x] +
+                    colors[z * resolution + x + 1] +
+                    colors[(z + 1) * resolution + x] +
+                    colors[(z + 1) * resolution + x + 1]
+                ) * 0.25f;
+
+                if (avgColor.a <= 0f)
+                    continue;
+
+                // Calculate world positions for the quad corners
+                Vector3 p0 = GetTerrainSamplePosition(x, z, resolution, terrainPos, terrainSize);
+                Vector3 p1 = GetTerrainSamplePosition(x + 1, z, resolution, terrainPos, terrainSize);
+                Vector3 p2 = GetTerrainSamplePosition(x + 1, z + 1, resolution, terrainPos, terrainSize);
+                Vector3 p3 = GetTerrainSamplePosition(x, z + 1, resolution, terrainPos, terrainSize);
+
+                // Convert to screen space and draw
+                Vector2 sp0 = HandleUtility.WorldToGUIPoint(p0);
+                Vector2 sp1 = HandleUtility.WorldToGUIPoint(p1);
+                Vector2 sp2 = HandleUtility.WorldToGUIPoint(p2);
+                Vector2 sp3 = HandleUtility.WorldToGUIPoint(p3);
+
+                Handles.color = avgColor;
+                DrawQuad(sp0, sp1, sp2, sp3);
+            }
+        }
+        Handles.EndGUI();
+    }
+
+    private Vector3 GetTerrainSamplePosition(int x, int z, int resolution, Vector3 terrainPos, Vector3 terrainSize)
+    {
+        float normalizedX = x / (float)(resolution - 1);
+        float normalizedZ = z / (float)(resolution - 1);
+        return terrainPos + new Vector3(
+            normalizedX * terrainSize.x,
+            terrain.terrainData.GetHeight(z, x) * terrainSize.y,
+            normalizedZ * terrainSize.z
+        );
+    }
+
+    private void DrawQuad(Vector2 p0, Vector2 p1, Vector2 p2, Vector2 p3)
+    {
+        Handles.DrawLine(p0, p1);
+        Handles.DrawLine(p1, p2);
+        Handles.DrawLine(p2, p3);
+        Handles.DrawLine(p3, p0);
+    }
+
+    private void InitializeMask()
+    {
+        if (terrain == null || terrain.terrainData == null)
+        {
+            return;
+        }
+
+        int resolution = terrain.terrainData.heightmapResolution;
+        terrainMask = new byte[resolution, resolution];
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int x = 0; x < resolution; x++)
+            {
+                terrainMask[z, x] = (byte)MaskType.Unknown;
+            }
         }
     }
 
